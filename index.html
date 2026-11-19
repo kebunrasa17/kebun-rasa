@@ -253,7 +253,8 @@ select{width:100%;font:inherit;color:var(--ink);background:var(--soft);border:1p
       <button class="mi" id="mCo"><span>Data usaha untuk dokumen<small>Alamat, telepon, rekening, penandatangan</small></span><span>&#8250;</span></button>
       <button class="mi red" id="mClear"><span>Hapus semua pesanan tanggal ini<small id="mClearLbl"></small></span><span>&#8250;</span></button>
     </div>
-    <div class="card" style="padding:4px 12px;margin-top:14px"><button class="mi" id="mReload"><span>Muat ulang dari server<small>Ambil data terbaru dari Google Sheets</small></span><span>&#8250;</span></button><button class="mi" id="mKode"><span>Ganti kode akses<small>Untuk perangkat ini</small></span><span>&#8250;</span></button></div>
+    <div class="card" style="padding:4px 12px;margin-top:14px"><button class="mi" id="mReload"><span>Muat ulang dari server<small>Ambil data terbaru dari Google Sheets</small></span><span>&#8250;</span></button><button class="mi" id="mTes"><span>Tes koneksi<small>Periksa alamat, kode, dan akses Google Sheets</small></span><span>&#8250;</span></button><button class="mi" id="mKode"><span>Ganti kode akses<small>Untuk perangkat ini</small></span><span>&#8250;</span></button></div>
+    <p class="hint" id="tesOut" style="color:var(--ink)"></p>
     <p class="hint">Data pesanan tersimpan di Google Sheets dan dipakai bersama semua orang yang memegang kode akses. Perubahan dari perangkat lain muncul otomatis dalam beberapa detik. Kalau sedang offline, perubahan disimpan dulu di perangkat dan dikirim saat online lagi.</p>
   </section>
 </main>
@@ -369,11 +370,21 @@ function diff(){
   return{adds:adds,ups:ups,dels:dels,sigs:sigs};
 }
 function pendingN(){var d=diff();return d.adds.length+d.ups.length+d.dels.length}
+var lastErr="";
+async function callApi(url,opt){
+  var ctl=typeof AbortController!=="undefined"?new AbortController():null,tm=ctl?setTimeout(function(){ctl.abort()},25000):0,o=opt||{},r,t;
+  if(ctl)o.signal=ctl.signal;
+  try{r=await fetch(url,o);t=await r.text()}
+  catch(e){clearTimeout(tm);var er=new Error("net");er.why=(e&&e.name==="AbortError")?"Google tidak menjawab dalam 25 detik. Periksa alamat /exec dan koneksi internet.":"Tidak bisa terhubung ke Google. Periksa alamat /exec dan pastikan akses Deploy = Siapa saja.";throw er}
+  clearTimeout(tm);
+  try{return JSON.parse(t)}
+  catch(e){var er2=new Error("html");er2.why="Google mengirim halaman login atau error, bukan data. Pastikan Deploy: akses = Siapa saja, memakai URL /exec, dan cek Apps Script > Executions.";throw er2}
+}
 function setSync(msg){
   var e=document.getElementById("sync");if(!e)return;var n=pendingN(),t,c="ok";
   if(!API||!KODE){t="Belum terhubung";c="off"}else if(msg){t=msg;c="busy"}else if(syncing){t="Menyimpan...";c="busy"}
-  else if(n&&!online){t="Offline \u00b7 "+n+" belum tersimpan";c="off"}else if(n){t="Menunggu simpan";c="busy"}
-  else if(!online){t="Offline";c="off"}else{t="Tersimpan";c="ok"}
+  else if(n&&!online){t="Belum tersimpan ("+n+"). "+(lastErr||"Periksa koneksi.");c="off"}else if(n){t="Menunggu simpan";c="busy"}
+  else if(!online){t="Tidak terhubung. "+(lastErr||"");c="off"}else{t="Tersimpan";c="ok"}
   e.textContent=t;e.className="sync "+c+(c==="ok"?"":" show");
 }
 function persist(){cacheSave();clearTimeout(dirtyT);dirtyT=setTimeout(flush,400);setSync()}
@@ -382,11 +393,11 @@ async function flush(){
   var d=diff();if(!d.adds.length&&!d.ups.length&&!d.dels.length){setSync();return}
   syncing=true;setSync();var ok=false,retry=true;
   try{
-    var r=await fetch(API,{method:"POST",body:JSON.stringify({kode:KODE,action:"batch",adds:d.adds,updates:d.ups,deletes:d.dels})}),j=await r.json();
-    if(!j.ok){if(j.error==="kode"){retry=false;askKode("Kode akses salah atau sudah diganti.")}throw new Error(j.error||"gagal")}
-    d.adds.concat(d.ups).forEach(function(x){snap[x.id]=d.sigs[x.id]});d.dels.forEach(function(id){delete snap[id]});
-    cacheSave();online=true;ok=true;
-  }catch(e){online=false;if(retry)setTimeout(flush,8000)}
+    var j=await callApi(API,{method:"POST",body:JSON.stringify({kode:KODE,action:"batch",adds:d.adds,updates:d.ups,deletes:d.dels})});
+    if(!j.ok){var x=new Error("api");if(j.error==="kode"){retry=false;x.why="Kode akses salah atau sudah diganti.";askKode(x.why)}else x.why="Server menolak: "+(j.error||"gagal");throw x}
+    d.adds.concat(d.ups).forEach(function(q){snap[q.id]=d.sigs[q.id]});d.dels.forEach(function(id){delete snap[id]});
+    cacheSave();online=true;ok=true;lastErr="";
+  }catch(e){online=false;lastErr=(e&&e.why)||"Gagal mengirim.";if(retry)setTimeout(flush,8000)}
   syncing=false;setSync();
   if(ok&&pendingN())flush();
 }
@@ -396,14 +407,23 @@ async function load(quiet){
   if(syncing||pendingN())return;
   if(!quiet)setSync("Memuat...");
   try{
-    var r=await fetch(API+"?kode="+encodeURIComponent(KODE)),j=await r.json();
-    if(!j.ok){if(j.error==="kode"){KODE="";try{localStorage.removeItem("rekap-kode")}catch(e){}askKode("Kode salah. Coba lagi.")}throw new Error("gagal")}
+    var j=await callApi(API+"?kode="+encodeURIComponent(KODE));
+    if(!j.ok){var x=new Error("api");if(j.error==="kode"){KODE="";try{localStorage.removeItem("rekap-kode")}catch(e){}x.why="Kode akses salah.";askKode("Kode salah. Coba lagi.")}else x.why="Server menolak: "+(j.error||"gagal");throw x}
     if(syncing||pendingN()){setSync();return}
     var nd={},ns={};
     j.data.forEach(function(x){var o={id:x.id,kitchen:x.dapur,item:x.barang,qty:Number(x.jumlah),unit:x.satuan,note:x.keterangan||""};(nd[x.tanggal]=nd[x.tanggal]||[]).push(o);ns[o.id]=sig(x.tanggal,o)});
-    data=nd;snap=ns;cacheSave();online=true;renderAll();
-  }catch(e){online=false}
+    data=nd;snap=ns;cacheSave();online=true;lastErr="";renderAll();
+  }catch(e){online=false;lastErr=(e&&e.why)||""}
   setSync();firstReady();
+}
+async function tesKoneksi(){
+  var out=$$("tesOut");
+  if(!API){out.textContent="Alamat Web App belum diisi.";openSetup();return}
+  out.textContent="Menguji koneksi...";
+  try{
+    var j=await callApi(API+"?kode="+encodeURIComponent(KODE||""));
+    out.textContent=j&&j.ok?"Terhubung. Ada "+j.data.length+" pesanan di Google Sheets.":(j&&j.error==="kode"?"Alamat benar, tetapi kode akses salah.":"Server menjawab: "+JSON.stringify(j).slice(0,100));
+  }catch(e){out.textContent=(e&&e.why)||"Tidak bisa terhubung."}
 }
 function askKode(msg){
   var m=$$("kmodal");$$("kmsg").textContent=msg||"Masukkan kode akses dari pemilik rekap.";
@@ -422,7 +442,7 @@ function initSync(){
     $$("kmodal").classList.remove("show");load();flush();
   };
   $$("kcancel").onclick=function(){$$("kmodal").classList.remove("show")};
-  $$("mReload").onclick=function(){load()};
+  $$("mReload").onclick=function(){load()};$$("mTes").onclick=tesKoneksi;
   $$("mKode").onclick=function(){askKode("Masukkan kode akses baru untuk perangkat ini.")};
   setSync();
   setTimeout(firstReady,Object.keys(data).length?250:5000);
